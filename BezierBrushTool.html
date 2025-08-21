@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bezier Brush Tool</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/addons/p5.dom.min.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #f0f0f0; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    canvas { display: block; }
+    h3, h4 { margin: 8px 0; }
+    .p5Element { user-select: none; }
+  </style>
+</head>
+<body>
+<script>
+// Bezier Editor + Live Brush (two-ends thick by default; Sweep is thin-to-thick)
+// Adds: Swoop with middle control point (your 10-point preset), 
+// handle mirroring around ANY anchor, and anchor-drag moves adjacent handles.
+// Default gradient = Cyan → Mint.
+
+// ---------- UI / State ----------
+const panelW = 250;
+let showEditor = true;
+
+let controlPoints = [];   // [{pos: p5.Vector, type:'anchor'|'handle'}]
+let draggingPoint = null;
+let dragOffset = { x: 0, y: 0 };
+let dragStartPos = null;  // for anchor-drag delta
+let selectedPreset = -1;
+// let coordDiv; // (kept for optional debugging, not shown in UI)
+
+let sizeSlider, thinningSlider;
+let paletteSelect;
+
+// export/draw area (right canvas, inset 100px on all sides)
+function getExportRect() {
+  return {
+    x: panelW + 100,
+    y: 100,
+    w: (width - panelW) - 200,
+    h: height - 200
+  };
+}
+
+// 7 gradient palettes
+const palettes = [
+  { name: 'Cyan → Bright Blue', a: '#53B5F8', b: '#088AFF' },
+  { name: 'Cyan → Dark Blue',   a: '#53B5F8', b: '#001276' },
+  { name: 'Cyan → Mint',        a: '#53B5F8', b: '#AFFDFD' }, // <- default
+  { name: 'Cyan → Orange',      a: '#53B5F8', b: '#F6CAC9' },
+  { name: 'Cyan → Green',       a: '#53B5F8', b: '#75FAAC' },
+  { name: 'Cyan → Pink',        a: '#53B5F8', b: '#EDC1FA' },
+  { name: 'Cyan → Yellow',      a: '#53B5F8', b: '#FCF593' },
+];
+
+// for Sweep thickness profile switch
+let currentProfile = 'ends-thick'; // 'ends-thick' | 'thin-to-thick'
+
+// ---------- Setup ----------
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  pixelDensity(2);
+  buildUI();
+
+  // default preset
+  selectedPreset = 0;
+  loadPreset(0);
+}
+
+// ---------- UI ----------
+function buildUI() {
+  const ui = createDiv();
+  ui.position(0, 0);
+  ui.size(panelW, windowHeight);
+  ui.style('background', '#f5f5f5');
+  ui.style('padding', '10px');
+  ui.style('box-sizing', 'border-box');
+
+  createElement('h3', 'Bezier Brush Tool').parent(ui);
+
+  // Toggle Editor
+  createButton('👁 Toggle Editor').parent(ui).style('width', '100%').mousePressed(() => {
+    showEditor = !showEditor;
+  });
+
+  // Presets
+  createElement('h4', 'Presets').parent(ui);
+  const names = ['Soar', 'Glide', 'Swoop', 'Twist', 'Sweep', 'Launch'];
+  for (let i = 0; i < names.length; i++) {
+    const btn = createButton(names[i]).parent(ui);
+    btn.style('width', '100%');
+    btn.style('margin-bottom', '6px');
+    btn.mousePressed(() => {
+      selectedPreset = i;
+      loadPreset(i);
+    });
+  }
+
+  // palettes
+  createElement('h4', 'Gradient Palette').parent(ui);
+  paletteSelect = createSelect().parent(ui).style('width', '100%');
+  palettes.forEach((p, idx) => paletteSelect.option(p.name, idx));
+  paletteSelect.selected(2); // default: Cyan → Mint
+
+  // brush controls
+  createElement('h4', 'Brush Controls').parent(ui);
+  createSpan('Stroke Size').parent(ui);
+  sizeSlider = createSlider(30, 220, 90, 1).parent(ui);
+  createSpan('Thinning').style('display', 'block').parent(ui);
+  thinningSlider = createSlider(0.1, 1.0, 0.95, 0.05).parent(ui);
+
+  // Exports
+  createElement('h4', 'Export').parent(ui);
+  createButton('💾 Save PNG (with background)').parent(ui).style('width', '100%').mousePressed(() => {
+    savePNGCropped(true);
+  });
+  createButton('💾 Save PNG (transparent)').parent(ui).style('width', '100%').mousePressed(() => {
+    savePNGCropped(false);
+  });
+
+  // (Coords UI intentionally hidden; logging can be enabled in updateCoordDisplay)
+}
+
+// ---------- Presets & geometry ----------
+function P(x, y, type) { return { pos: createVector(x, y), type }; }
+
+function loadPreset(index) {
+  controlPoints = [];
+  currentProfile = (index === 4) ? 'thin-to-thick' : 'ends-thick'; // Sweep special
+
+  if (index === 0) {
+    // Soar (7 points)
+    controlPoints = [
+      P(462.0, 646.5, 'anchor'),
+      P(376.0, 321.5, 'handle'),
+      P(382.0, 197.0, 'handle'),
+      P(510.0, 410.5, 'anchor'),
+      P(638.0, 624.0, 'handle'),
+      P(1079.0, 536.5, 'handle'),
+      P(889.0, 58.5, 'anchor'),
+    ];
+  } else if (index === 1) {
+    // Glide (single segment, 4 points)
+    controlPoints = [
+      P(350.0, 360.5, 'anchor'),
+      P(450.9, 492.5, 'handle'),
+      P(943.8, 627.5, 'handle'),
+      P(971.0, 59.5,  'anchor'),
+    ];
+  } else if (index === 2) {
+    // Swoop — 10-point preset (two interior anchors)
+    controlPoints = [
+      P(327.0, 398.5, 'anchor'),   // 0
+      P(474.0, 404.3, 'handle'),   // 1
+      P(512.8, 172.8, 'handle'),   // 2
+      P(545.6, 192.9, 'anchor'),   // 3
+      P(578.4, 213.0, 'handle'),   // 4
+      P(472.1, 528.6, 'handle'),   // 5
+      P(518.9, 527.5, 'anchor'),   // 6
+      P(609.4, 529.3, 'handle'),   // 7
+      P(741.9, 201.0, 'handle'),   // 8
+      P(1122.0, 198.5, 'anchor'),  // 9
+    ];
+  } else if (index === 3) {
+    // Twist (7 points)
+    controlPoints = [
+      P(320.0, 124.5, 'anchor'),
+      P(603.0, 138.5, 'handle'),
+      P(872.5, 188.5, 'handle'),
+      P(607.5, 366.5, 'anchor'),
+      P(342.5, 544.5, 'handle'),
+      P(852.0, 635.5, 'handle'),
+      P(1145.0, 147.5, 'anchor'),
+    ];
+  } else if (index === 4) {
+    // Sweep (single segment, thin->thick)
+    controlPoints = [
+      P(534.0, 79.5, 'anchor'),
+      P(271.9, 383.5, 'handle'),
+      P(482.8, 555.5, 'handle'),
+      P(1117.0, 242.5, 'anchor'),
+    ];
+  } else if (index === 5) {
+    // Launch (7 points)
+    controlPoints = [
+      P(710.0, 37.5,  'anchor'),
+      P(250.0, 355.5, 'handle'),
+      P(873.5, 265.5, 'handle'),
+      P(878.5, 335.5, 'anchor'),
+      P(883.5, 405.5, 'handle'),
+      P(615.0, 476.5, 'handle'),
+      P(306.0, 484.5, 'anchor'),
+    ];
+  }
+}
+
+// ---------- Editor / Interaction ----------
+function draw() {
+  // 1) Background gradient only inside exportRect
+  drawBackgroundInsideExportRect();
+
+  // 2) Sample path from control points
+  const path = sampleBezierPath(controlPoints);
+
+  // 3) Draw brush
+  if (path.length > 2) {
+    drawFilledBrushGradient(path);
+  }
+
+  // 4) Editor overlay (toggle-able)
+  if (showEditor) drawEditorOverlay();
+
+  // 5) (Optional) log coordinates to console
+  // if (showEditor) updateCoordDisplay();
+}
+
+// background gradient only inside exportRect
+function drawBackgroundInsideExportRect(g = this) {
+  const exp = getExportRect();
+  // checkerboard outside area to mimic transparent bg
+  background(240);
+  noStroke();
+  const cell = 20;
+  for (let y = 0; y < height; y += cell) {
+    for (let x = panelW; x < width; x += cell) {
+      fill(((x/cell + y/cell) % 2) ? 230 : 255);
+      rect(x, y, cell, cell);
+    }
+  }
+
+  // choose palette for background too (first color top 80%, second bottom 20%)
+  const pal = palettes[+paletteSelect.value() || 0];
+  const colA = color(pal.a); // top
+  const colB = color(pal.b); // bottom
+
+  // vertical gradient within exp rect
+  for (let y = 0; y < exp.h; y++) {
+    const t = y / (exp.h - 1); // 0..1
+    // 80/20 proportion towards the second color (adjust 0.2 to change)
+    const c = lerpColor(colA, colB, t * 0.2);
+    g.stroke(c);
+    g.line(exp.x, exp.y + y, exp.x + exp.w, exp.y + y);
+  }
+
+  // left panel separator
+  if (g === this) {
+    stroke(200);
+    line(panelW, 0, panelW, height);
+  }
+}
+
+// draw editor overlay: curves, control lines, points
+function drawEditorOverlay() {
+  push();
+  translate(panelW, 0);
+
+  if (controlPoints.length >= 4) {
+    // Curve
+    noFill();
+    stroke(0);
+    strokeWeight(2);
+    for (let i = 0; i <= controlPoints.length - 4; i += 3) {
+      const p0 = controlPoints[i].pos;
+      const p1 = controlPoints[i + 1].pos;
+      const p2 = controlPoints[i + 2].pos;
+      const p3 = controlPoints[i + 3].pos;
+      bezier(
+        p0.x - panelW, p0.y,
+        p1.x - panelW, p1.y,
+        p2.x - panelW, p2.y,
+        p3.x - panelW, p3.y
+      );
+    }
+
+    // Control lines
+    stroke(180);
+    strokeWeight(1);
+    for (let i = 0; i <= controlPoints.length - 4; i += 3) {
+      const a0 = controlPoints[i].pos;
+      const h1 = controlPoints[i + 1].pos;
+      const h2 = controlPoints[i + 2].pos;
+      const a1 = controlPoints[i + 3].pos;
+      line(a0.x - panelW, a0.y, h1.x - panelW, h1.y);
+      line(a1.x - panelW, a1.y, h2.x - panelW, h2.y);
+    }
+
+    // Points
+    noStroke();
+    for (let idx = 0; idx < controlPoints.length; idx++) {
+      const pt = controlPoints[idx];
+      fill(pt.type === 'anchor' ? '#0077ff' : '#ff7a00');
+      circle(pt.pos.x - panelW, pt.pos.y, 10);
+    }
+  }
+
+  pop();
+}
+
+// mouse interactions with clamping + anchor/handle logic
+function mousePressed() {
+  if (!showEditor) return;
+  for (const pt of controlPoints) {
+    if (dist(mouseX, mouseY, pt.pos.x, pt.pos.y) < 10) {
+      draggingPoint = pt;
+      dragOffset.x = mouseX - pt.pos.x;
+      dragOffset.y = mouseY - pt.pos.y;
+      dragStartPos = pt.pos.copy(); // store for anchor delta
+      break;
+    }
+  }
+}
+
+function mouseDragged() {
+  if (!draggingPoint || !showEditor) return;
+
+  // move current point within bounds
+  draggingPoint.pos.x = clamp(mouseX - dragOffset.x, panelW, width);
+  draggingPoint.pos.y = clamp(mouseY - dragOffset.y, 0, height);
+
+  const idx = controlPoints.indexOf(draggingPoint);
+
+  // 1) If dragging an ANCHOR: move its adjacent handles by the same delta
+  if (draggingPoint.type === 'anchor') {
+    const delta = p5.Vector.sub(draggingPoint.pos, dragStartPos);
+    const leftIdx  = idx - 1;
+    const rightIdx = idx + 1;
+    if (controlPoints[leftIdx]?.type === 'handle') {
+      controlPoints[leftIdx].pos.add(delta);
+      controlPoints[leftIdx].pos.x = clamp(controlPoints[leftIdx].pos.x, panelW, width);
+      controlPoints[leftIdx].pos.y = clamp(controlPoints[leftIdx].pos.y, 0, height);
+    }
+    if (controlPoints[rightIdx]?.type === 'handle') {
+      controlPoints[rightIdx].pos.add(delta);
+      controlPoints[rightIdx].pos.x = clamp(controlPoints[rightIdx].pos.x, panelW, width);
+      controlPoints[rightIdx].pos.y = clamp(controlPoints[rightIdx].pos.y, 0, height);
+    }
+    // update base for continuous dragging
+    dragStartPos = draggingPoint.pos.copy();
+  }
+
+  // 2) If dragging a HANDLE: mirror the opposite handle around the anchor (G1 continuity)
+  for (let anchorIdx = 0; anchorIdx < controlPoints.length; anchorIdx++) {
+    if (controlPoints[anchorIdx]?.type !== 'anchor') continue;
+    const leftIdx  = anchorIdx - 1;
+    const rightIdx = anchorIdx + 1;
+    const leftIsHandle  = controlPoints[leftIdx]?.type  === 'handle';
+    const rightIsHandle = controlPoints[rightIdx]?.type === 'handle';
+    if (!leftIsHandle || !rightIsHandle) continue;
+
+    // Only act if the dragged point is one of those two handles
+    if (idx !== leftIdx && idx !== rightIdx) continue;
+
+    const anchorPos = controlPoints[anchorIdx].pos;
+    const draggedPos = controlPoints[idx].pos;
+
+    const v = p5.Vector.sub(draggedPos, anchorPos);
+    const mirror = p5.Vector.sub(anchorPos, v); // anchor - (dragged - anchor)
+
+    const otherIdx = (idx === leftIdx) ? rightIdx : leftIdx;
+    controlPoints[otherIdx].pos.set(
+      clamp(mirror.x, panelW, width),
+      clamp(mirror.y, 0, height)
+    );
+  }
+}
+
+function mouseReleased() {
+  draggingPoint = null;
+  dragStartPos = null;
+}
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+// ---------- Path sampling & Brush rendering ----------
+function sampleBezierPath(points) {
+  const sampled = [];
+  if (points.length < 4) return sampled;
+  const step = 0.01; // density
+
+  for (let i = 0; i <= points.length - 4; i += 3) {
+    const p0 = points[i].pos.copy();
+    const p1 = points[i + 1].pos.copy();
+    const p2 = points[i + 2].pos.copy();
+    const p3 = points[i + 3].pos.copy();
+
+    for (let t = 0; t <= 1.00001; t += step) {
+      if (i > 0 && t === 0) continue; // avoid duplicate at joints
+      const x = bezierPoint(p0.x, p1.x, p2.x, p3.x, t);
+      const y = bezierPoint(p0.y, p1.y, p2.y, p3.y, t);
+      sampled.push(createVector(x, y));
+    }
+  }
+  return sampled;
+}
+
+// thickness profiles
+function widthFactor(t, profile, thinning) {
+  if (profile === 'thin-to-thick') {
+    // monotonic increasing (start thin -> end thick)
+    const f = t;
+    return (1 - thinning) + thinning * f;
+  } else {
+    // default: ends thick, middle thin
+    const dip = 1 - sin(t * PI); // 1 at ends, 0 at middle
+    return (1 - thinning) + thinning * dip;
+  }
+}
+
+function drawFilledBrushGradient(path, g = this) {
+  if (path.length < 3) return;
+
+  const s = sizeSlider?.value() ?? 90;
+  const thinning = thinningSlider?.value() ?? 0.8;
+  const pal = palettes[+paletteSelect.value() || 0];
+
+  // Line gradient rule: start uses second color, end uses first color
+  const colStart = color(pal.b);
+  const colEnd   = color(pal.a);
+
+  g.noStroke();
+
+  for (let i = 1; i < path.length - 2; i++) {
+    const prev  = path[i - 1];
+    const curr  = path[i];
+    const next  = path[i + 1];
+    const after = path[i + 2];
+
+    const t1 = i / (path.length - 1);
+    const t2 = (i + 1) / (path.length - 1);
+
+    const f1 = widthFactor(t1, currentProfile, thinning);
+    const f2 = widthFactor(t2, currentProfile, thinning);
+
+    const w1 = s * f1;
+    const w2 = s * f2;
+
+    const dir1 = p5.Vector.sub(next, prev).normalize();
+    const dir2 = p5.Vector.sub(after, curr).normalize();
+
+    const n1 = createVector(-dir1.y, dir1.x);
+    const n2 = createVector(-dir2.y, dir2.x);
+
+    const p1a = p5.Vector.add(curr, n1.copy().mult(w1 / 2));
+    const p1b = p5.Vector.sub(curr, n1.copy().mult(w1 / 2));
+    const p2a = p5.Vector.add(next, n2.copy().mult(w2 / 2));
+    const p2b = p5.Vector.sub(next, n2.copy().mult(w2 / 2));
+
+    const fillCol = lerpColor(colStart, colEnd, t1);
+    g.fill(fillCol);
+
+    g.beginShape();
+    g.vertex(p1a.x, p1a.y);
+    g.vertex(p2a.x, p2a.y);
+    g.vertex(p2b.x, p2b.y);
+    g.vertex(p1b.x, p1b.y);
+    g.endShape(CLOSE);
+  }
+}
+
+// ---------- Export cropped to exportRect ----------
+function savePNGCropped(withBg = true) {
+  const exp = getExportRect();
+  const pg = createGraphics(exp.w, exp.h);
+  if (withBg) {
+    // background gradient in pg space: first color top 80%, second color bottom 20%
+    const pal = palettes[+paletteSelect.value() || 0];
+    const colA = color(pal.a);
+    const colB = color(pal.b);
+    for (let y = 0; y < exp.h; y++) {
+      const t = y / (exp.h - 1);
+      const c = lerpColor(colA, colB, t * 0.2); // 0..0.2 portion towards second color
+      pg.stroke(c);
+      pg.line(0, y, exp.w, y);
+    }
+  } else {
+    pg.clear();
+  }
+
+  const path = sampleBezierPath(controlPoints);
+  if (path.length > 2) {
+    drawBrushIntoGraphics(path, pg, -exp.x, -exp.y);
+  }
+
+  save(pg, withBg ? 'brushWithBackground.png' : 'brushTransparent.png');
+}
+
+function drawBrushIntoGraphics(path, g, dx, dy) {
+  const s = sizeSlider?.value() ?? 90;
+  const thinning = thinningSlider?.value() ?? 0.8;
+  const pal = palettes[+paletteSelect.value() || 0];
+
+  const colStart = color(pal.b);
+  const colEnd   = color(pal.a);
+
+  g.noStroke();
+
+  for (let i = 1; i < path.length - 2; i++) {
+    const prev  = path[i - 1];
+    const curr  = path[i];
+    const next  = path[i + 1];
+    const after = path[i + 2];
+
+    const t1 = i / (path.length - 1);
+    const t2 = (i + 1) / (path.length - 1);
+
+    const f1 = widthFactor(t1, currentProfile, thinning);
+    const f2 = widthFactor(t2, currentProfile, thinning);
+
+    const w1 = s * f1;
+    const w2 = s * f2;
+
+    const dir1 = p5.Vector.sub(next, prev).normalize();
+    const dir2 = p5.Vector.sub(after, curr).normalize();
+
+    const n1 = createVector(-dir1.y, dir1.x);
+    const n2 = createVector(-dir2.y, dir2.x);
+
+    const p1a = p5.Vector.add(curr, n1.copy().mult(w1 / 2));
+    const p1b = p5.Vector.sub(curr, n1.copy().mult(w1 / 2));
+    const p2a = p5.Vector.add(next, n2.copy().mult(w2 / 2));
+    const p2b = p5.Vector.sub(next, n2.copy().mult(w2 / 2));
+
+    const fillCol = lerpColor(colStart, colEnd, t1);
+    g.fill(fillCol);
+
+    g.beginShape();
+    g.vertex(p1a.x + dx, p1a.y + dy);
+    g.vertex(p2a.x + dx, p2a.y + dy);
+    g.vertex(p2b.x + dx, p2b.y + dy);
+    g.vertex(p1b.x + dx, p1b.y + dy);
+    g.endShape(CLOSE);
+  }
+}
+
+// ---------- Coords (console-only helper; UI hidden) ----------
+function updateCoordDisplay() {
+  // Uncomment if you want to log while editing:
+  // console.clear();
+  // controlPoints.forEach((pt, i) => {
+  //   console.log(`${i}: ${pt.type.toUpperCase()}  (${pt.pos.x.toFixed(1)}, ${pt.pos.y.toFixed(1)})`);
+  // });
+}
+
+// ---------- Resize ----------
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+</script>
+</body>
+</html>
